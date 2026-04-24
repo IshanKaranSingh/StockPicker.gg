@@ -130,5 +130,5 @@ else:
     st.subheader('About StockPicker.gg')
     st.write('StockPicker.gg is a Streamlit-based stock ranking and research site built around the S&P 500 baseline.')
     st.write('Deploy this repo on Streamlit Community Cloud to get a public live URL.')
-    st.code('pip install -r requirements.txt
-streamlit run app.py', language='bash')
+    st.code("pip install -r requirements.txt\nstreamlit run app.py", language='bash')
+   
