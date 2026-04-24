@@ -1,0 +1,150 @@
+from pathlib import Path
+base = Path('output/stockpicker_downloadables')
+base.mkdir(parents=True, exist_ok=True)
+files = {
+'app.py': '''import streamlit as st
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import plotly.express as px
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, roc_auc_score
+
+st.set_page_config(page_title="StockPicker.gg", page_icon="📈", layout="wide")
+
+st.markdown("""
+<style>
+.block-container {padding-top: 1.2rem; padding-bottom: 2rem;}
+.hero {padding: 1.2rem 1.4rem; border-radius: 18px; background: linear-gradient(135deg, #0f172a 0%, #111827 50%, #1f2937 100%); color: white; border: 1px solid rgba(255,255,255,0.08);}
+.small-muted {color: #94a3b8; font-size: 0.95rem;}
+.card {padding: 1rem 1rem; border-radius: 16px; border: 1px solid rgba(148,163,184,0.18); background: rgba(15,23,42,0.02);}
+</style>
+""", unsafe_allow_html=True)
+
+@st.cache_data(ttl=3600)
+def load_sp500():
+    df = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
+    df['Symbol'] = df['Symbol'].str.replace('.', '-', regex=False)
+    return df[['Symbol', 'Security', 'GICS Sector']].rename(columns={'Symbol':'ticker','Security':'company','GICS Sector':'sector'})
+
+@st.cache_data(ttl=900)
+def download_prices(ticker, period='5y'):
+    df = yf.download(ticker, period=period, auto_adjust=True, progress=False)
+    if df.empty:
+        return df
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] for c in df.columns]
+    return df
+
+@st.cache_data(ttl=900)
+def build_features(price_df, horizon=21):
+    df = price_df.copy()
+    df['ret1'] = df['Close'].pct_change(1)
+    df['ret5'] = df['Close'].pct_change(5)
+    df['ret21'] = df['Close'].pct_change(21)
+    df['ma10'] = df['Close'].rolling(10).mean()
+    df['ma20'] = df['Close'].rolling(20).mean()
+    df['ma50'] = df['Close'].rolling(50).mean()
+    df['vol20'] = df['ret1'].rolling(20).std()
+    df['vol50'] = df['ret1'].rolling(50).std()
+    df['volume_chg'] = df['Volume'].pct_change(5)
+    df['momentum_gap'] = df['ma10'] / df['ma50'] - 1
+    df['future_ret'] = df['Close'].shift(-horizon) / df['Close'] - 1
+    return df.dropna()
+
+sp500 = load_sp500()
+st.sidebar.title("StockPicker.gg")
+page = st.sidebar.radio("Navigate", ["Dashboard", "Rank Stocks", "Backtest", "About"], index=0)
+
+if page == "Dashboard":
+    st.markdown("<div class='hero'><h1 style='margin-bottom:0;'>StockPicker.gg</h1><p style='margin-top:0.4rem;'>An AI-powered S&P 500 stock ranking app with backtesting.</p></div>", unsafe_allow_html=True)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Universe", "S&P 500")
+    c2.metric("Model", "Random Forest")
+    c3.metric("Horizon", "21 trading days")
+    c4.metric("Baseline", "S&P 500")
+    spy = download_prices('^GSPC', '2y')
+    if not spy.empty:
+        st.plotly_chart(px.line(spy.reset_index(), x='Date', y='Close', title='S&P 500 index'), use_container_width=True)
+
+elif page == "Rank Stocks":
+    st.subheader("Rank stocks")
+    n = st.slider("How many S&P 500 names to scan", 10, 30, 10, 5)
+    horizon = st.selectbox("Forecast horizon", [5, 21, 63], index=1)
+    top_n = st.slider("Show top N", 5, 20, 10)
+    if st.button("Run ranking"):
+        rows = []
+        for t in sp500['ticker'].tolist()[:n]:
+            df = download_prices(t, '2y')
+            if df.empty or len(df) < 150:
+                continue
+            feat = build_features(df, horizon=horizon)
+            if len(feat) < 120:
+                continue
+            cols = ['ret1','ret5','ret21','ma10','ma20','ma50','vol20','vol50','volume_chg','momentum_gap']
+            X = feat[cols]
+            y = (feat['future_ret'] > 0).astype(int)
+            split = int(len(feat) * 0.8)
+            if split < 60 or y.iloc[:split].nunique() < 2:
+                continue
+            model = RandomForestClassifier(n_estimators=200, max_depth=5, random_state=42, class_weight='balanced')
+            model.fit(X.iloc[:split], y.iloc[:split])
+            prob = float(model.predict_proba([X.iloc[-1]])[0,1])
+            pred = model.predict(X.iloc[split:])
+            proba_test = model.predict_proba(X.iloc[split:])[:,1]
+            rows.append({'ticker': t, 'score': prob, 'auc': roc_auc_score(y.iloc[split:], proba_test) if y.iloc[split:].nunique() > 1 else np.nan, 'accuracy': accuracy_score(y.iloc[split:], pred), 'last_price': float(feat['Close'].iloc[-1])})
+        res = pd.DataFrame(rows).sort_values('score', ascending=False)
+        if res.empty:
+            st.warning('Not enough data to rank stocks right now.')
+        else:
+            st.dataframe(res.head(top_n), use_container_width=True)
+            st.plotly_chart(px.bar(res.head(top_n).sort_values('score'), x='score', y='ticker', orientation='h', title='Top ranked names'), use_container_width=True)
+
+elif page == "Backtest":
+    ticker = st.selectbox("Pick a ticker", sp500['ticker'].tolist(), index=sp500['ticker'].tolist().index('AAPL') if 'AAPL' in sp500['ticker'].tolist() else 0)
+    horizon = st.selectbox("Backtest horizon", [5, 21, 63], index=1, key='bt_horizon')
+    if st.button("Run backtest"):
+        df = download_prices(ticker, '5y')
+        if df.empty or len(df) < 250:
+            st.error('Not enough history for backtest.')
+        else:
+            feat = build_features(df, horizon=horizon)
+            cols = ['ret1','ret5','ret21','ma10','ma20','ma50','vol20','vol50','volume_chg','momentum_gap']
+            X = feat[cols]
+            y = (feat['future_ret'] > 0).astype(int)
+            split = int(len(feat) * 0.8)
+            model = RandomForestClassifier(n_estimators=300, max_depth=5, random_state=42, class_weight='balanced')
+            model.fit(X.iloc[:split], y.iloc[:split])
+            test_proba = model.predict_proba(X.iloc[split:])[:,1]
+            bt = feat.iloc[split:].copy()
+            bt['signal'] = (test_proba > 0.55).astype(int)
+            bt['strategy_ret'] = bt['signal'] * bt['future_ret']
+            bt['buy_hold_ret'] = bt['future_ret']
+            bt['strategy_curve'] = (1 + bt['strategy_ret'].fillna(0)).cumprod()
+            bt['bh_curve'] = (1 + bt['buy_hold_ret'].fillna(0)).cumprod()
+            st.metric('Model accuracy', f"{accuracy_score(y.iloc[split:], model.predict(X.iloc[split:])):.2%}")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.plotly_chart(px.line(bt.reset_index(), x='Date', y='strategy_curve', title='Strategy equity curve'), use_container_width=True)
+            with c2:
+                st.plotly_chart(px.line(bt.reset_index(), x='Date', y='bh_curve', title='Buy & hold equity curve'), use_container_width=True)
+            st.dataframe(pd.DataFrame({'metric': ['Final strategy multiple', 'Final buy&hold multiple', 'Active periods'], 'value': [bt['strategy_curve'].iloc[-1], bt['bh_curve'].iloc[-1], int(bt['signal'].sum())]}), use_container_width=True)
+
+else:
+    st.subheader('About StockPicker.gg')
+    st.write('StockPicker.gg is a Streamlit-based stock ranking and research site built around the S&P 500 baseline.')
+    st.write('Deploy this repo on Streamlit Community Cloud to get a public live URL.')
+    st.code('pip install -r requirements.txt\nstreamlit run app.py', language='bash')
+''',
+'requirements.txt': 'streamlit\npandas\nnumpy\nyfinance\nscikit-learn\nplotly\nlxml\nhtml5lib\n',
+'README.md': '# StockPicker.gg\n\n## Fastest way to get a live link\n\n1. Create a new GitHub repo named `stockpicker-gg`.\n2. Upload `app.py`, `requirements.txt`, and `README.md`.\n3. Go to Streamlit Community Cloud and connect the repo.\n4. Deploy the app.\n\nStreamlit will generate a public URL like `https://your-app-name.streamlit.app`.\n',
+'.streamlit/config.toml': '[theme]\nbase="dark"\nprimaryColor="#3b82f6"\nbackgroundColor="#0b1020"\nsecondaryBackgroundColor="#111827"\ntextColor="#e5e7eb"\n'
+}
+for name, content in files.items():
+    p = base / name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content)
+print('Created files in', base)
+for p in base.rglob('*'):
+    if p.is_file():
+        print(p.relative_to(base))
